@@ -134,8 +134,10 @@ func (e *Engine) seal(j *Job) (any, error) {
 		if old.ID == j.ID || old.Fingerprint != fingerprint || old.State == "cancelled" {
 			continue
 		}
-		if old.State == "failed" {
-			// Prefer a live or completed match; a failed one is revived below.
+		if old.State == "failed" && old.Error == "upload_failed_check_account_and_network" {
+			// Prefer a live or completed match; an exhausted retry is revived
+			// below. Uncertain commits and remote-component conflicts stay
+			// failed: an automatic backup request must not resend them.
 			if failed == nil {
 				failed = old
 			}

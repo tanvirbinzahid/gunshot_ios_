@@ -156,11 +156,31 @@ func TestReimportRevivesFailedJob(t *testing.T) {
 	}
 }
 
+// An uncertain commit may already be remote; an automatic re-request must not
+// resend it (TestUncertainCommitDoesNotAutoRetry). Only exhausted retries revive.
+func TestReimportKeepsUncertainCommitFailed(t *testing.T) {
+	for _, reason := range []string{"commit_outcome_unknown", "remote_live_photo_component_exists"} {
+		e := newEngine(t, nil)
+		j, _ := importRAWJPEG(t, e)
+		j.State = "failed"
+		j.Error = reason
+		j.Attempts = 1
+		if err := e.save(); err != nil {
+			t.Fatal(err)
+		}
+		_, reply := importRAWJPEG(t, e)
+		if reply["id"] != j.ID || j.State != "failed" || j.Error != reason || j.Attempts != 1 {
+			t.Fatalf("%s: unsafe automatic revive: %v %+v", reason, reply, j)
+		}
+	}
+}
+
 // A completed or active job remains the preferred duplicate target.
 func TestReimportPrefersCompletedOverFailed(t *testing.T) {
 	e := newEngine(t, nil)
 	failed := importTest(t, e, "quota")
 	failed.State = "failed"
+	failed.Error = "upload_failed_check_account_and_network"
 	done := &Job{}
 	*done = *failed
 	done.ID = strings.Repeat("ab", 16)
