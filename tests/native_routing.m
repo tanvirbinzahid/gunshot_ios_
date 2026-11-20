@@ -195,8 +195,9 @@ int main(void) {
         GSSetNativeRouting(NO, nil);
         [behavior backupLocalAssets:@[ local ]];
         assert(originalCount == 4 && importedCount == 5);
-        NSLog(@"PASS silent manual import, batch, original policy, account binding, invalid assets, "
-              @"native Locked Folder, export failure, recovery and no native fallback");
+        NSLog(
+            @"PASS silent manual import, batch, original policy, account binding, invalid assets, "
+            @"native Locked Folder, export failure, recovery and no native fallback");
         return 0;
     }
 }
