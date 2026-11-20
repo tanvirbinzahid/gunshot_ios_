@@ -73,8 +73,13 @@ static BOOL GSImportAuthorized(NSString *account, NSString *identity) {
     });
     return authorized && [GSRequest(@{@"op" : @"accounts"}, nil)[@"selected"] isEqual:account];
 }
+// Locked Folder media stays private: GoToHP cannot upload into the server-side
+// Locked Folder and must not publish it to the main library.
+static NSString *const GSLockedFolderMessage =
+    @"Locked Folder items stay private and are not uploaded by GoToHP.";
 static void GSRoute(id localAssets) {
     NSMutableArray *assets = [NSMutableArray array];
+    NSUInteger locked = 0;
     BOOL valid =
         [localAssets isKindOfClass:NSArray.class] || [localAssets isKindOfClass:NSSet.class];
     if (valid)
@@ -84,8 +89,9 @@ static void GSRoute(id localAssets) {
                 asset = local;
             else if ([local isKindOfClass:NSClassFromString(@"PHSLocalAsset")]) {
                 if (((BOOL(*)(id, SEL))objc_msgSend)(local, NSSelectorFromString(@"isLocked"))) {
-                    valid = NO;
-                    break;
+                    // Skip it; the rest of the selection is still backed up.
+                    locked++;
+                    continue;
                 }
                 asset = ((id(*)(id, SEL))objc_msgSend)(local, NSSelectorFromString(@"phAsset"));
             }
@@ -99,9 +105,14 @@ static void GSRoute(id localAssets) {
     GSInitializeImport();
     @synchronized(GSImportLock) {
         GSImportStatus[@"actions"] = @([GSImportStatus[@"actions"] unsignedIntegerValue] + 1);
+        if (locked)
+            GSImportStatus[@"lockedSkipped"] =
+                @([GSImportStatus[@"lockedSkipped"] unsignedIntegerValue] + locked);
     }
     if (!valid || !assets.count) {
-        GSImportResult(@"The selected photos could not be retrieved.", 0);
+        GSImportResult(valid && locked ? GSLockedFolderMessage
+                                       : @"The selected photos could not be retrieved.",
+                       0);
         return;
     }
     NSString *account = [GSNativeRoutingAccount() copy];
@@ -169,20 +180,8 @@ static void GSRoute(id localAssets) {
         });
     });
 }
-// Locked Folder items are not PhotoKit assets and belong in the server-side
-// Locked Folder; an all-locked action keeps Google Photos' own upload.
-static BOOL GSOnlyLockedAssets(id localAssets) {
-    if (!([localAssets isKindOfClass:NSArray.class] || [localAssets isKindOfClass:NSSet.class]) ||
-        ![localAssets count])
-        return NO;
-    for (id asset in localAssets)
-        if (!GSPhotosHasMethod(object_getClass(asset), @"isLocked", "B16@0:8") ||
-            !((BOOL(*)(id, SEL))objc_msgSend)(asset, NSSelectorFromString(@"isLocked")))
-            return NO;
-    return YES;
-}
 static void GSBackup(id object, SEL selector, id assets) {
-    if (!GSNativeRoutingEnabled() || GSOnlyLockedAssets(assets)) {
+    if (!GSNativeRoutingEnabled()) {
         GSBackupOriginal(object, selector, assets);
         return;
     }
@@ -194,7 +193,7 @@ static void GSBackup(id object, SEL selector, id assets) {
     GSRoute(assets);
 }
 static void GSGridBackup(id object, SEL selector, id assets) {
-    if (!GSNativeRoutingEnabled() || GSOnlyLockedAssets(assets)) {
+    if (!GSNativeRoutingEnabled()) {
         GSGridBackupOriginal(object, selector, assets);
         return;
     }

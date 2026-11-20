@@ -313,6 +313,15 @@ NSString *GSImportFiles(NSArray *files, NSString *account, NSString *quality, NS
         failures++;
 }
 @end
+// Locked Folder requests are identified by class or by their locked delegate.
+@interface PHSLockedPhotoMediaUploadRequest : GMUAssetUploadRequest
+@end
+@implementation PHSLockedPhotoMediaUploadRequest
+@end
+@interface PHSLockedPhotoBackupControllerImpl : NSObject
+@end
+@implementation PHSLockedPhotoBackupControllerImpl
+@end
 static id Request(Class c, id account) {
     id r = [c new];
     PHAsset *asset = [PHAsset new];
@@ -725,12 +734,28 @@ int main(void) {
         assert(queued == before && nativeStarts == starts);
         ((GSFixtureIdentity *)primaryAccount->_ssoIdentity).hasValidAuth = YES;
         assert(GSNativeIdentityMatches(@"fixture-user-A"));
+        // Locked Folder media stays private: it fails distinctly without being
+        // exported, queued to Go, or sent through the native payload path.
+        NSUInteger payload = nativePayload;
+        before = queued;
+        finished = successes + failures;
+        id lockedClass = Request(PHSLockedPhotoMediaUploadRequest.class,
+                                 [[GIPGaiaAccountID alloc] initWithGaiaID:@"fixture-user-A"]);
+        [lockedClass start];
+        Drain(finished + 1);
+        id lockedDelegate = Request(GMUAssetUploadRequest.class,
+                                    [[GIPGaiaAccountID alloc] initWithGaiaID:@"fixture-user-A"]);
+        [lockedDelegate setDelegate:[PHSLockedPhotoBackupControllerImpl new]];
+        [lockedDelegate start];
+        Drain(finished + 2);
+        assert(queued == before && nativeStarts == starts && nativePayload == payload);
+        assert([GSBackupRequestsSnapshot()[@"lockedFolderSkipped"] integerValue] == 2);
         CheckProgress();
         CheckBackground();
         CheckOverlappingReconciliation();
         NSLog(@"PASS native manual UI through Go and native completion, automatic request handoff, "
               @"background video and live-upload proxying, original resources, account binding, "
-              @"duplicate start, cancellation and native fallback blocking");
+              @"duplicate start, Locked Folder privacy, cancellation and native fallback blocking");
         return 0;
     }
 }

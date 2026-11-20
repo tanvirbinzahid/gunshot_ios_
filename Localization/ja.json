@@ -1,5 +1,6 @@
 {
   "Check the GoToHP queue for details. Native upload has not been used.": "GoToHP のキューで状態を確認してください。純正アップロードには切り替えていません。",
+  "Locked Folder items stay private and are not uploaded by GoToHP.": "ロックされたフォルダのアイテムは非公開のまま保持され、GoToHP ではアップロードされません。",
   "Original quality (original data available)": "オリジナル画質（原本データあり）",
   "GoToHP settings": "GoToHP の設定",
   "Liquid Glass for the bottom bar and search button. Requires iOS 26 or later.": "下部バーと検索ボタンを Liquid Glass にします。iOS 26 以降で利用できます。",
