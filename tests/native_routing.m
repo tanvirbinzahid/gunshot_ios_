@@ -130,21 +130,24 @@ int main(void) {
         assert(importedCount == 3 && originalCount == 2);
         [behavior backupLocalAssets:@[ local, @"unknown" ]];
         Drain(3, 1);
+        // Locked Folder items are not PhotoKit assets and must reach the
+        // server-side Locked Folder, so an all-locked action stays native.
         local.isLocked = YES;
         [grid backupLocalAssets:@[ local ]];
-        Drain(3, 2);
+        assert(originalCount == 3 && importedCount == 3);
+        Drain(3, 1);
         local.isLocked = NO;
         selected = @"other@example.com";
         [behavior backupLocalAssets:@[ local ]];
-        Drain(3, 3);
+        Drain(3, 2);
         selected = @"destination@example.com";
         failExport = YES;
         [behavior backupLocalAssets:@[ local ]];
-        Drain(3, 4);
-        assert(importedCount == 3 && originalCount == 2 && GSNativeRoutingSnapshot()[@"lastError"]);
+        Drain(3, 3);
+        assert(importedCount == 3 && originalCount == 3 && GSNativeRoutingSnapshot()[@"lastError"]);
         failExport = NO;
         [behavior backupLocalAssets:@[ local ]];
-        Drain(4, 4);
+        Drain(4, 3);
         assert(!GSNativeRoutingSnapshot()[@"lastError"]);
         // Changing the identity, selected account, destination, or toggle during
         // PhotoKit export must not import even the first asset (nor later assets).
@@ -165,7 +168,7 @@ int main(void) {
                 GSSetNativeRouting(NO, nil);
             }
         ];
-        NSUInteger failed = 4;
+        NSUInteger failed = 3;
         for (void (^change)(void) in changes) {
             identity = @"native-destination";
             selected = @"destination@example.com";
@@ -173,7 +176,7 @@ int main(void) {
             duringExport = change;
             [behavior backupLocalAssets:@[ local, local.phAsset ]];
             Drain(4, ++failed);
-            assert(importedCount == 4 && originalCount == 2);
+            assert(importedCount == 4 && originalCount == 3);
             assert(![NSFileManager.defaultManager fileExistsAtPath:exportDirectory.path]);
         }
         duringExport = nil;
@@ -191,9 +194,9 @@ int main(void) {
         assert(!exportDirectory);
         GSSetNativeRouting(NO, nil);
         [behavior backupLocalAssets:@[ local ]];
-        assert(originalCount == 3 && importedCount == 5);
-        NSLog(@"PASS silent manual import, batch, original policy, account binding, invalid/locked "
-              @"assets, export failure, recovery and no native fallback");
+        assert(originalCount == 4 && importedCount == 5);
+        NSLog(@"PASS silent manual import, batch, original policy, account binding, invalid assets, "
+              @"native Locked Folder, export failure, recovery and no native fallback");
         return 0;
     }
 }
