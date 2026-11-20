@@ -124,20 +124,33 @@ func (e *Engine) seal(j *Job) (any, error) {
 	}
 	fingerprint := hex.EncodeToString(h.Sum(nil))
 	delete(e.importHashes, j.ID)
+	var failed *Job
 	for _, old := range e.state.Jobs {
 		// Older builds could mark original completed from a saver hash match.
 		// Do not reuse that unverified completion for a new original request.
 		if j.Quality == "original" && old.State == "completed" && old.OriginalPolicy == 0 {
 			continue
 		}
-		if old.ID != j.ID && old.Fingerprint == fingerprint && old.State != "cancelled" {
-			j.State = "cancelled"
-			if err := e.save(); err != nil {
-				return nil, err
-			}
-			_ = os.RemoveAll(e.jobDir(j.ID))
-			return map[string]any{"id": old.ID, "duplicate": true}, nil
+		if old.ID == j.ID || old.Fingerprint != fingerprint || old.State == "cancelled" {
+			continue
 		}
+		if old.State == "failed" {
+			// Prefer a live or completed match; a failed one is revived below.
+			if failed == nil {
+				failed = old
+			}
+			continue
+		}
+		return e.sealDuplicate(j, old)
+	}
+	if failed != nil {
+		// A new request for the same media is an explicit retry (#73). Reusing
+		// the failed job keeps its staged files and committed RAW+JPEG
+		// components, so a native backup retry neither stalls on the old
+		// failure nor re-uploads photos that are already remote (#74).
+		failed.resetRetry()
+		failed.Error = ""
+		return e.sealDuplicate(j, failed)
 	}
 	j.Fingerprint = fingerprint
 	j.State = "pending"
@@ -145,4 +158,13 @@ func (e *Engine) seal(j *Job) (any, error) {
 		return nil, err
 	}
 	return map[string]any{"id": j.ID}, nil
+}
+
+func (e *Engine) sealDuplicate(j, old *Job) (any, error) {
+	j.State = "cancelled"
+	if err := e.save(); err != nil {
+		return nil, err
+	}
+	_ = os.RemoveAll(e.jobDir(j.ID))
+	return map[string]any{"id": old.ID, "duplicate": true}, nil
 }

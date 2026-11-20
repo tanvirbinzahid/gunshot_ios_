@@ -45,42 +45,81 @@ func (e *Engine) Tick() {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		e.active[j.ID] = cancel
-		paths := make([]string, 0, len(j.Resources))
-		for _, f := range j.Resources {
-			paths = append(paths, filepath.Join(e.jobDir(j.ID), f.Name))
+		if j.ComponentKeys == nil && len(j.Resources) == 2 && rawJPEGPair([]string{j.Resources[0].Name, j.Resources[1].Name}) {
+			j.ComponentKeys = make([]string, len(j.Resources))
 		}
+		// Committed RAW+JPEG components are remote already; resend only the rest.
+		paths := make([]string, 0, len(j.Resources))
+		indexes := make([]int, 0, len(j.Resources))
+		var base int64
+		for i, f := range j.Resources {
+			if len(j.ComponentKeys) == len(j.Resources) && j.ComponentKeys[i] != "" {
+				base += f.Size
+				continue
+			}
+			paths = append(paths, filepath.Join(e.jobDir(j.ID), f.Name))
+			indexes = append(indexes, i)
+		}
+		j.Uploaded = base
 		e.wg.Add(1)
-		go e.execute(ctx, *j, paths)
+		go e.execute(ctx, *j, paths, indexes, base)
 	}
 }
-func (e *Engine) execute(ctx context.Context, snapshot Job, paths []string) {
+func (e *Engine) execute(ctx context.Context, snapshot Job, paths []string, indexes []int, base int64) {
 	defer e.wg.Done()
-	key, err := e.runner(ctx, paths, snapshot.Account, snapshot.Quality, func(p Progress) {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		j := e.find(snapshot.ID)
-		if j == nil {
-			return
-		}
-		old := j.State
-		if p.State == "uploading" || p.State == "committing" || p.State == "preparing" {
-			j.State = p.State
-		}
-		j.Uploaded = p.Uploaded
-		if p.Total > 0 {
-			j.Total = p.Total
-		}
-		// Byte progress stays in memory; durable phase transitions protect crash recovery.
-		if old != j.State && e.save() != nil {
-			e.active[j.ID]()
-		}
-	})
+	key, err := "", error(nil)
+	if len(paths) == 0 {
+		// Every component was committed before an interruption.
+		key = snapshot.ComponentKeys[0]
+	} else {
+		key, err = e.runner(ctx, paths, snapshot.Account, snapshot.Quality, func(p Progress) {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			j := e.find(snapshot.ID)
+			if j == nil {
+				return
+			}
+			if p.MediaKey != "" {
+				if p.Component < 0 || p.Component >= len(indexes) || len(j.ComponentKeys) != len(j.Resources) {
+					return
+				}
+				// A component commit must be durable before the next upload starts.
+				j.ComponentKeys[indexes[p.Component]] = p.MediaKey
+				j.Uploaded = base + p.Uploaded
+				if e.save() != nil {
+					e.active[j.ID]()
+				}
+				return
+			}
+			old := j.State
+			if p.State == "uploading" || p.State == "committing" || p.State == "preparing" {
+				j.State = p.State
+			}
+			j.Uploaded = base + p.Uploaded
+			if p.Total > 0 {
+				j.Total = p.Total
+			}
+			// Byte progress stays in memory; durable phase transitions protect crash recovery.
+			if old != j.State && e.save() != nil {
+				e.active[j.ID]()
+			}
+		})
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	j := e.find(snapshot.ID)
 	delete(e.active, snapshot.ID)
 	if j == nil {
 		return
+	}
+	if err == nil && key != "" && len(j.ComponentKeys) == len(j.Resources) {
+		if len(indexes) == 1 {
+			// A lone remaining component uses the ordinary single-photo path.
+			j.ComponentKeys[indexes[0]] = key
+		}
+		if j.ComponentKeys[0] != "" {
+			key = j.ComponentKeys[0]
+		}
 	}
 	switch {
 	case err == nil && key != "":

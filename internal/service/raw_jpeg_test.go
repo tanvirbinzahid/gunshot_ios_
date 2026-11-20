@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -92,8 +93,13 @@ func TestRAWJPEGUploadsBothAsIndependentPhotos(t *testing.T) {
 					}
 				}
 				var last Progress
+				var commits []string
 				sawRAWOffset := false
 				key, err := upload(context.Background(), paths, "a@example.com", quality, func(p Progress) {
+					if p.MediaKey != "" {
+						commits = append(commits, fmt.Sprintf("%d=%s", p.Component, p.MediaKey))
+						return
+					}
 					last = p
 					if p.State == "uploading" && p.Uploaded == 11 {
 						sawRAWOffset = true
@@ -103,8 +109,13 @@ func TestRAWJPEGUploadsBothAsIndependentPhotos(t *testing.T) {
 					if err == nil || key != "" || last.State != "committing" {
 						t.Fatalf("partial/unknown commit reported success: key=%q err=%v phase=%s", key, err, last.State)
 					}
+					if strings.Join(commits, ",") != "0=preview.JPG-key" {
+						t.Fatalf("committed JPEG not reported before the RAW failure: %v", commits)
+					}
 				} else if err != nil || key != "preview.JPG-key" {
 					t.Fatalf("both uploads did not complete: key=%q err=%v", key, err)
+				} else if strings.Join(commits, ",") != "0=preview.JPG-key,1=original.DNG-key" {
+					t.Fatalf("component commits not reported: %v", commits)
 				}
 				mu.Lock()
 				defer mu.Unlock()

@@ -114,10 +114,12 @@ func upload(ctx context.Context, paths []string, account, quality string, cb fun
 	}
 	// RAW+JPEG are two independent photos, not a still/movie Live Photo pair.
 	// Keep one durable job and report success only after both commits succeed.
+	// Each commit is reported immediately so a later failure retries only the
+	// photo that is still missing (#74).
 	opts.PairLivePhotos = false
 	var primaryKey string
 	var completed int64
-	for _, path := range paths {
+	for index, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
 			return "", err
@@ -130,6 +132,7 @@ func upload(ctx context.Context, paths []string, account, quality string, cb fun
 			primaryKey = key
 		}
 		completed += info.Size()
+		cb(Progress{State: "component_committed", Uploaded: completed, Component: index, MediaKey: key})
 	}
 	return primaryKey, nil
 }

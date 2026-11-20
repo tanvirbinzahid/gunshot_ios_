@@ -46,6 +46,7 @@ type Job struct {
 	Total           int64      `json:"total"`
 	Error           string     `json:"error,omitempty"`
 	MediaKey        string     `json:"mediaKey,omitempty"`
+	ComponentKeys   []string   `json:"componentKeys,omitempty"` // RAW+JPEG commits parallel to Resources; retries skip committed photos.
 	CancelRequested bool       `json:"cancelRequested,omitempty"`
 	Owner           string     `json:"owner"`
 }
@@ -76,6 +77,10 @@ type Request struct {
 type Progress struct {
 	State           string
 	Uploaded, Total int64
+	// MediaKey reports a durable commit of paths[Component] before the job
+	// finishes (RAW+JPEG only); it does not change the job phase.
+	Component int
+	MediaKey  string
 }
 type Runner func(context.Context, []string, string, string, func(Progress)) (string, error)
 

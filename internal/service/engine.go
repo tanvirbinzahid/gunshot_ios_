@@ -54,6 +54,15 @@ func Open(root string, runner Runner) (*Engine, error) {
 		case "uploading", "preparing":
 			j.State = "pending"
 		case "committing":
+			if allComponentsCommitted(j) {
+				// The last RAW+JPEG commit was recorded before the interruption.
+				en.state.CompletionRevision++
+				j.State = "completed"
+				j.MediaKey = j.ComponentKeys[0]
+				j.Uploaded = j.Total
+				j.Error = ""
+				break
+			}
 			j.State = "failed"
 			j.Error = "commit_outcome_unknown"
 		case "importing":

@@ -71,8 +71,23 @@ func validateState(s State) error {
 		if j.Total != total {
 			return errors.New("invalid persisted resource sizes")
 		}
+		if j.ComponentKeys != nil && len(j.ComponentKeys) != len(j.Resources) {
+			return errors.New("invalid persisted component keys")
+		}
 	}
 	return nil
+}
+
+func allComponentsCommitted(j *Job) bool {
+	if len(j.ComponentKeys) == 0 || len(j.ComponentKeys) != len(j.Resources) {
+		return false
+	}
+	for _, key := range j.ComponentKeys {
+		if key == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func unfinishedJobs(jobs []*Job) int {

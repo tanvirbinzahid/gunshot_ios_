@@ -102,6 +102,40 @@ static BOOL GSStillAuthorized(GSBackupTransfer *transfer) {
            [GSNativeRoutingAccount() isEqual:transfer.account] &&
            GSNativeIdentityMatches(transfer.identityIdentifier);
 }
+// Locked Folder media lives in Google Photos' encrypted store (PHSLockedLocalAsset),
+// not PhotoKit, and must be committed into the server-side Locked Folder. GoToHP
+// cannot export it and must never publish it to the main library, so these
+// requests keep the native upload path instead of failing with code 1/4.
+static BOOL GSIsLockedFolderObject(id object) {
+    for (Class c = object_getClass(object); c; c = class_getSuperclass(c))
+        if ([NSStringFromClass(c) hasPrefix:@"PHSLockedPhoto"])
+            return YES;
+    Class locked = NSClassFromString(@"PHSLockedLocalAsset");
+    return locked && [GSPhotosGetObject(object, @"asset") isKindOfClass:locked];
+}
+static BOOL GSIsLockedFolderRequest(id request) {
+    // Locked Live Photo components report to their parent locked request.
+    for (NSUInteger depth = 0; request && depth < 3; depth++) {
+        if (GSIsLockedFolderObject(request))
+            return YES;
+        request = GSPhotosGetObject(request, @"delegate");
+    }
+    return NO;
+}
+// Scotty receives only a GMUUploadAsset; inspect its source asset when exposed.
+static BOOL GSIsLockedUploadAsset(id upload) {
+    Class locked = NSClassFromString(@"PHSLockedLocalAsset");
+    if (!upload || !locked)
+        return NO;
+    id asset = GSPhotosGetObject(upload, @"asset");
+    if (!asset) {
+        Ivar ivar = class_getInstanceVariable(object_getClass(upload), "_asset");
+        const char *type = ivar ? ivar_getTypeEncoding(ivar) : NULL;
+        if (type && type[0] == '@')
+            asset = object_getIvar(upload, ivar);
+    }
+    return [asset isKindOfClass:locked];
+}
 static void GSReportProgress(id request, GSBackupTransfer *transfer, NSDictionary *state) {
     NSNumber *uploaded = state[@"uploaded"], *total = state[@"total"];
     if (![uploaded isKindOfClass:NSNumber.class] || ![total isKindOfClass:NSNumber.class] ||
@@ -135,6 +169,11 @@ static void GSStart(id request, SEL selector, IMP original) {
         return;
     }
     if (!GSNativeRoutingEnabled()) {
+        ((void (*)(id, SEL))original)(request, selector);
+        return;
+    }
+    if (GSIsLockedFolderRequest(request)) {
+        GSCount(@"lockedFolderNative");
         ((void (*)(id, SEL))original)(request, selector);
         return;
     }
@@ -386,6 +425,10 @@ static BOOL GSBlockNative(void) {
     return GSNativeRoutingEnabled() || active;
 }
 static void GSGuard(id request, SEL selector, IMP original) {
+    if (!objc_getAssociatedObject(request, &GSTransferKey) && GSIsLockedFolderRequest(request)) {
+        ((void (*)(id, SEL))original)(request, selector);
+        return;
+    }
     if (GSBlockNative() || objc_getAssociatedObject(request, &GSTransferKey)) {
         GSCount(@"nativePayloadBlocked");
         GSFail(request, 4);
@@ -434,7 +477,8 @@ static void GSBindBackground(Class c) {
     SEL upload = NSSelectorFromString(@"beginUploadMediaRequestWithFingerprint:");
     IMP oldUpload = method_getImplementation(class_getInstanceMethod(c, upload));
     GSReplace(c, upload, imp_implementationWithBlock(^(id request, id fingerprint) {
-                  if (GSBlockNative() || objc_getAssociatedObject(request, &GSTransferKey)) {
+                  if (objc_getAssociatedObject(request, &GSTransferKey) ||
+                      (GSBlockNative() && !GSIsLockedFolderRequest(request))) {
                       GSCount(@"nativePayloadBlocked");
                       GSFail(request, 4);
                       return;
@@ -455,7 +499,7 @@ static void GSBindScotty(void) {
                   imp_implementationWithBlock(^(id service, id asset, BOOL cellular,
                                                 BOOL background, id start, id progress, id released,
                                                 void (^done)(id, id)) {
-                      if (!GSBlockNative()) {
+                      if (!GSBlockNative() || GSIsLockedUploadAsset(asset)) {
                           ((void (*)(id, SEL, id, BOOL, BOOL, id, id, id, id))old)(
                               service, s, asset, cellular, background, start, progress, released,
                               done);
@@ -477,7 +521,7 @@ static void GSBindScotty(void) {
         GSReplace(c, stateless,
                   imp_implementationWithBlock(^(id service, id asset, BOOL cellular, id progress,
                                                 void (^done)(id, id)) {
-                      if (!GSBlockNative()) {
+                      if (!GSBlockNative() || GSIsLockedUploadAsset(asset)) {
                           ((void (*)(id, SEL, id, BOOL, id, id))old)(service, stateless, asset,
                                                                      cellular, progress, done);
                           return;

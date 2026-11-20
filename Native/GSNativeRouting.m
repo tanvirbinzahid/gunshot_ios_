@@ -169,8 +169,20 @@ static void GSRoute(id localAssets) {
         });
     });
 }
+// Locked Folder items are not PhotoKit assets and belong in the server-side
+// Locked Folder; an all-locked action keeps Google Photos' own upload.
+static BOOL GSOnlyLockedAssets(id localAssets) {
+    if (!([localAssets isKindOfClass:NSArray.class] || [localAssets isKindOfClass:NSSet.class]) ||
+        ![localAssets count])
+        return NO;
+    for (id asset in localAssets)
+        if (!GSPhotosHasMethod(object_getClass(asset), @"isLocked", "B16@0:8") ||
+            !((BOOL(*)(id, SEL))objc_msgSend)(asset, NSSelectorFromString(@"isLocked")))
+            return NO;
+    return YES;
+}
 static void GSBackup(id object, SEL selector, id assets) {
-    if (!GSNativeRoutingEnabled()) {
+    if (!GSNativeRoutingEnabled() || GSOnlyLockedAssets(assets)) {
         GSBackupOriginal(object, selector, assets);
         return;
     }
@@ -182,7 +194,7 @@ static void GSBackup(id object, SEL selector, id assets) {
     GSRoute(assets);
 }
 static void GSGridBackup(id object, SEL selector, id assets) {
-    if (!GSNativeRoutingEnabled()) {
+    if (!GSNativeRoutingEnabled() || GSOnlyLockedAssets(assets)) {
         GSGridBackupOriginal(object, selector, assets);
         return;
     }
