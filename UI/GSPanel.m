@@ -411,6 +411,8 @@
     return self.controlSections[section - 1][@"title"];
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (self.settingsMode && section == self.queueSection + 1)
+        return [NSString stringWithFormat:GSL(@"Modified by %@"), @"Tanvir (@tanvirbinzahid)"];
     if (section == 0 || section >= self.queueSection)
         return nil;
     return self.controlSections[section - 1][@"footer"];

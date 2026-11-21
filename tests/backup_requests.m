@@ -27,6 +27,15 @@ static BOOL backgroundFingerprintError;
 static atomic_bool foreground = YES, online = YES, wifi = YES, charging = YES, paused = NO,
                    holdJob = NO, failJob = NO, switchDuringExport = NO;
 static PHSAccount *primaryAccount, *otherAccount;
+// Native existence fingerprints expose a SHA-1 hex digest.
+@interface GMUFingerprint : NSObject
+@property (nonatomic, copy) NSString *sha1HexDigest;
+@end
+@implementation GMUFingerprint
+@end
+static GMUFingerprint *fixtureFingerprint;
+static atomic_ulong exports;
+static atomic_bool writeExport = NO;
 @implementation PHAsset
 @end
 @interface GSFixtureBundle : NSBundle
@@ -93,7 +102,11 @@ NSArray *GSExportAsset(PHAsset *asset, NSURL *directory, NSError **error) {
         dispatch_sync(dispatch_get_main_queue(), ^{
             GSFixtureSelectAccount(otherAccount);
         });
-    return @[ [directory URLByAppendingPathComponent:@"original.heic"] ];
+    exports++;
+    NSURL *file = [directory URLByAppendingPathComponent:@"original.heic"];
+    if (atomic_load(&writeExport))
+        [[@"fixture-bytes" dataUsingEncoding:NSUTF8StringEncoding] writeToURL:file atomically:NO];
+    return @[ file ];
 }
 NSString *GSImportFiles(NSArray *files, NSString *account, NSString *quality, NSDate *date,
                         NSError **error) {
@@ -146,13 +159,18 @@ NSString *GSImportFiles(NSArray *files, NSString *account, NSString *quality, NS
 @end
 @interface GMUAssetUploadRequest : GMUUploadRequest <ProgressRequest>
 @property (nonatomic, strong) PHAsset *asset;
+- (void)fingerprintDidComplete:(id)fingerprint error:(id)error;
 - (void)start;
 - (_Bool)shouldTimeout;
 - (void)cancel;
 @end
 @implementation GMUAssetUploadRequest
+- (void)fingerprintDidComplete:(id)fingerprint error:(id)error {
+}
 - (void)start {
     nativeStarts++;
+    if (fixtureFingerprint)
+        [self fingerprintDidComplete:fixtureFingerprint error:nil];
     if (holdNativeCompletion)
         return;
     if (remoteMatch)
@@ -750,12 +768,51 @@ int main(void) {
         Drain(finished + 2);
         assert(queued == before && nativeStarts == starts && nativePayload == payload);
         assert([GSBackupRequestsSnapshot()[@"lockedFolderSkipped"] integerValue] == 2);
+        // A finished upload is reused for the same asset revision, so a rescan of an
+        // item Google Photos does not recognise (ProRAW) neither exports nor uploads it.
+        [NSUserDefaults.standardUserDefaults
+            removeObjectForKey:@"dev.tqmane.gunshot.uploadedAssets"];
+        PHAsset *proRAW = [PHAsset new];
+        proRAW.localIdentifier = NSUUID.UUID.UUIDString;
+        proRAW.modificationDate = [NSDate dateWithTimeIntervalSince1970:1000];
+        atomic_store(&writeExport, YES);
+        fixtureFingerprint = [GMUFingerprint new];
+        fixtureFingerprint.sha1HexDigest = @"986923BD9259CE04552DE3ED555657157B86255A";
+        NSUInteger exported = exports;
+        before = queued;
+        finished = successes + failures;
+        for (NSUInteger pass = 0; pass < 3; pass++) {
+            if (pass == 1) // Google Photos checks other bytes: diagnose, do not re-upload.
+                fixtureFingerprint.sha1HexDigest = @"0000000000000000000000000000000000000000";
+            if (pass == 2) { // An edit is a new revision and is exported again.
+                proRAW.modificationDate = [NSDate dateWithTimeIntervalSince1970:2000];
+                fixtureFingerprint = nil;
+            }
+            id rescan = Request(GMUAssetUploadRequest.class,
+                                [[GIPGaiaAccountID alloc] initWithGaiaID:@"fixture-user-A"]);
+            [rescan setAsset:proRAW];
+            [rescan start];
+            Drain(finished + pass + 1);
+            NSUInteger uploads = pass == 2 ? 2 : 1;
+            assert(exports == exported + uploads && queued == before + uploads);
+        }
+        atomic_store(&writeExport, NO);
+        NSDictionary *fingerprints = GSBackupRequestsSnapshot();
+        assert([fingerprints[@"reusedUpload"] integerValue] == 1);
+        assert([fingerprints[@"fingerprintMatchesUpload"] integerValue] == 1);
+        assert([fingerprints[@"fingerprintDiffersFromUpload"] integerValue] == 1);
+        NSDate *rendered = [NSDate dateWithTimeIntervalSinceNow:3];
+        while (![GSBackupRequestsSnapshot()[@"fingerprintRenderedUnavailable"] integerValue] &&
+               rendered.timeIntervalSinceNow > 0)
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        assert([GSBackupRequestsSnapshot()[@"fingerprintRenderedUnavailable"] integerValue] == 1);
         CheckProgress();
         CheckBackground();
         CheckOverlappingReconciliation();
         NSLog(@"PASS native manual UI through Go and native completion, automatic request handoff, "
               @"background video and live-upload proxying, original resources, account binding, "
-              @"duplicate start, Locked Folder privacy, cancellation and native fallback blocking");
+              @"duplicate start, Locked Folder privacy, rescan reuse, fingerprint diagnostics, "
+              @"cancellation and native fallback blocking");
         return 0;
     }
 }

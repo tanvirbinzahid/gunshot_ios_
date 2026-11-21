@@ -21,6 +21,7 @@ typedef NS_ENUM(NSInteger, PHAssetResourceType) {
 @interface PHAsset : NSObject
 @property (nonatomic, copy) NSString *localIdentifier;
 @property (nonatomic, strong) NSDate *creationDate;
+@property (nonatomic, strong) NSDate *modificationDate;
 @property (nonatomic) PHAssetMediaType mediaType;
 @property (nonatomic) PHAssetMediaSubtype mediaSubtypes;
 + (PHFetchResult *)fetchAssetsWithLocalIdentifiers:(NSArray *)identifiers options:(id)options;

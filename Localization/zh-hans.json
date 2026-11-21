@@ -1,5 +1,6 @@
 {
   "Check the GoToHP queue for details. Native upload has not been used.": "未使用原生上传，请在 GoToHP 队列中查看详情",
+  "Modified by %@": "由 %@ 修改",
   "Locked Folder items stay private and are not uploaded by GoToHP.": "已锁定文件夹中的项目会保持私密，不会通过 GoToHP 上传",
   "Original quality (original data available)": "原始画质 (原始数据可用)",
   "GoToHP settings": "GoToHP 设置",

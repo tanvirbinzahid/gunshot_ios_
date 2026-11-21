@@ -9,6 +9,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <math.h>
+#include <CommonCrypto/CommonDigest.h>
 
 // Audited manual/automatic backup: Go commits, then native lookup confirms the
 // remote item. Block native payload fallback; report success only after lookup.
@@ -23,6 +24,9 @@
 // SSO userID string; native request credentials.accountID is a separate object.
 @property (nonatomic, copy) NSString *identityIdentifier;
 @property (nonatomic, copy) NSString *localID;
+// SHA-1 of every uploaded file, compared with the native existence fingerprint.
+@property (atomic, copy) NSArray<NSString *> *sha1s;
+@property (nonatomic, strong) PHAsset *asset;
 @end
 @implementation GSBackupTransfer
 @end
@@ -36,6 +40,128 @@ static void GSCount(NSString *key) {
     @synchronized(GSLock) {
         GSCounts[key] = @([GSCounts[key] unsignedIntegerValue] + 1);
     }
+}
+// A finished upload is remembered per asset revision, so every rescan of an
+// unrecognised item (ProRAW) neither re-exports nor re-uploads the same photo.
+static NSString *const GSUploadedAssetsKey = @"dev.tqmane.gunshot.uploadedAssets";
+static const NSUInteger GSUploadedAssetsLimit = 20000;
+static NSDictionary *GSUploadedAsset(NSString *key) {
+    @synchronized(GSLock) {
+        id entry = [NSUserDefaults.standardUserDefaults dictionaryForKey:GSUploadedAssetsKey][key];
+        return [entry isKindOfClass:NSDictionary.class] ? entry : nil;
+    }
+}
+static void GSRememberUploadedAsset(NSString *key, NSDictionary *entry) {
+    @synchronized(GSLock) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSMutableDictionary *all = [[defaults dictionaryForKey:GSUploadedAssetsKey] mutableCopy]
+                                       ?: [NSMutableDictionary dictionary];
+        if (entry && !all[key] && all.count >= GSUploadedAssetsLimit)
+            [all removeObjectForKey:all.allKeys.firstObject];
+        if (entry)
+            all[key] = entry;
+        else
+            [all removeObjectForKey:key];
+        [defaults setObject:all forKey:GSUploadedAssetsKey];
+    }
+}
+static NSString *GSHex(const unsigned char *digest) {
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA1_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++)
+        [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+// Google Photos fingerprints are SHA-1 digests; CommonCrypto marks SHA-1 as
+// insecure for signatures, which is not how it is used here.
+static NSString *GSFileSHA1(NSURL *url) {
+    NSInputStream *input = [NSInputStream inputStreamWithURL:url];
+    [input open];
+    if (input.streamStatus != NSStreamStatusOpen)
+        return nil;
+    CC_SHA1_CTX context;
+    CC_SHA1_Init(&context);
+    uint8_t buffer[65536];
+    NSInteger count;
+    while ((count = [input read:buffer maxLength:sizeof buffer]) > 0)
+        CC_SHA1_Update(&context, buffer, (CC_LONG)count);
+    [input close];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1_Final(digest, &context);
+    return count < 0 ? nil : GSHex(digest);
+}
+static NSString *GSDataSHA1(NSData *data) {
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(data.bytes, (CC_LONG)data.length, digest);
+    return GSHex(digest);
+}
+#pragma clang diagnostic pop
+// Diagnostics only: which bytes does Google Photos fingerprint for an item that
+// GoToHP uploaded? Counts are recorded, never hashes, names or identifiers.
+static NSString *GSFingerprintHex(id fingerprint) {
+    for (NSUInteger depth = 0; fingerprint && depth < 2; depth++) {
+        if (GSPhotosObjectHasMethod(fingerprint, @"sha1HexDigest", "@16@0:8")) {
+            id hex = GSPhotosGetObject(fingerprint, @"sha1HexDigest");
+            return [hex isKindOfClass:NSString.class] ? [hex lowercaseString] : nil;
+        }
+        fingerprint = GSPhotosGetObject(fingerprint, @"fingerprint");
+    }
+    return nil;
+}
+static void GSHashRendered(PHAsset *asset, NSInteger version, void (^done)(NSString *)) {
+    Class managerClass = NSClassFromString(@"PHImageManager"),
+          optionsClass = NSClassFromString(@"PHImageRequestOptions");
+    SEL request = NSSelectorFromString(@"requestImageDataAndOrientationForAsset:options:"
+                                       @"resultHandler:");
+    id manager =
+        [managerClass respondsToSelector:NSSelectorFromString(@"defaultManager")]
+            ? ((id(*)(id, SEL))objc_msgSend)(managerClass, NSSelectorFromString(@"defaultManager"))
+            : nil;
+    if (!asset || !optionsClass || ![manager respondsToSelector:request]) {
+        done(nil);
+        return;
+    }
+    id options = [optionsClass new];
+    [options setValue:@(version) forKey:@"version"];
+    [options setValue:@1 forKey:@"deliveryMode"]; // High quality: the full image data.
+    [options setValue:@NO forKey:@"networkAccessAllowed"];
+    void (^handler)(NSData *, NSString *, uint32_t, NSDictionary *) =
+        ^(NSData *data, NSString *uti, uint32_t orientation, NSDictionary *info) {
+            done(data.length ? GSDataSHA1(data) : nil);
+        };
+    ((int32_t(*)(id, SEL, id, id, id))objc_msgSend)(manager, request, asset, options, handler);
+}
+static void GSRecordFingerprint(id request, id fingerprint) {
+    GSBackupTransfer *transfer = objc_getAssociatedObject(request, &GSTransferKey);
+    if (!transfer.reconciling)
+        return;
+    NSString *hex = GSFingerprintHex(fingerprint);
+    NSArray *uploaded = transfer.sha1s;
+    if (!hex.length || !uploaded.count) {
+        GSCount(hex.length ? @"fingerprintUploadUnknown" : @"fingerprintUnreadable");
+        return;
+    }
+    if ([uploaded containsObject:hex]) {
+        GSCount(@"fingerprintMatchesUpload");
+        return;
+    }
+    GSCount(@"fingerprintDiffersFromUpload");
+    PHAsset *asset = transfer.asset;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        // PHImageRequestOptionsVersionCurrent = 0, Original = 2.
+        GSHashRendered(asset, 0, ^(NSString *current) {
+            if ([current isEqual:hex]) {
+                GSCount(@"fingerprintMatchesRenderedCurrent");
+                return;
+            }
+            GSHashRendered(asset, 2, ^(NSString *original) {
+                GSCount([original isEqual:hex] ? @"fingerprintMatchesRenderedOriginal"
+                        : current || original  ? @"fingerprintMatchesNothing"
+                                               : @"fingerprintRenderedUnavailable");
+            });
+        });
+    });
 }
 BOOL GSBackupRequestsAvailable(void) {
     return GSInstalled;
@@ -178,6 +304,7 @@ static void GSStart(id request, SEL selector, IMP original) {
     }
     GSBackupTransfer *transfer = [GSBackupTransfer new];
     transfer.localID = asset.localIdentifier;
+    transfer.asset = asset;
     objc_setAssociatedObject(request, &GSTransferKey, transfer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     GSCount(@"intercepted");
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -217,29 +344,60 @@ static void GSStart(id request, SEL selector, IMP original) {
                     GSCount(@"authorizationChanged");
                 error = [NSError errorWithDomain:@"GoToHP.Backup" code:2 userInfo:nil];
             }
-            NSURL *directory =
-                [NSURL fileURLWithPath:[NSTemporaryDirectory()
-                                           stringByAppendingPathComponent:NSUUID.UUID.UUIDString]
-                           isDirectory:YES];
-            NSArray *files = nil;
-            if (!error && [NSFileManager.defaultManager createDirectoryAtURL:directory
-                                                 withIntermediateDirectories:YES
-                                                                  attributes:@{
-                                                                      NSFilePosixPermissions : @0700
-                                                                  }
-                                                                       error:&error])
-                files = GSExportAsset(asset, directory, &error);
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                authorized = GSStillAuthorized(transfer);
-            });
-            if (files && !authorized && !transfer.cancelled)
-                GSCount(@"authorizationChanged");
-            NSString *job =
-                (authorized && files)
-                    ? GSImportFiles(files, destination, options[@"quality"] ?: @"original",
-                                    asset.creationDate, &error)
-                    : nil;
-            [NSFileManager.defaultManager removeItemAtURL:directory error:nil];
+            NSString *quality = options[@"quality"] ?: @"original";
+            NSString *uploadKey =
+                [NSString stringWithFormat:@"%@\n%@\n%@", destination, quality, transfer.localID];
+            NSNumber *revision = asset.modificationDate
+                                     ? @(floor(asset.modificationDate.timeIntervalSince1970))
+                                     : nil;
+            NSString *job = nil;
+            NSDictionary *known =
+                !error && authorized && revision ? GSUploadedAsset(uploadKey) : nil;
+            if (known) {
+                NSDictionary *state =
+                    [known[@"r"] isEqual:revision] && [known[@"j"] isKindOfClass:NSString.class]
+                        ? GSRequest(@{@"op" : @"job", @"id" : known[@"j"]}, nil)
+                        : nil;
+                if ([state[@"state"] isEqual:@"completed"] && [state[@"mediaKey"] length]) {
+                    job = known[@"j"];
+                    transfer.sha1s = [known[@"s"] isKindOfClass:NSArray.class] ? known[@"s"] : nil;
+                    GSCount(@"reusedUpload");
+                } else {
+                    GSRememberUploadedAsset(uploadKey, nil); // Edited, cleared or not finished.
+                }
+            }
+            BOOL reused = job != nil;
+            if (!reused) {
+                NSURL *directory = [NSURL
+                    fileURLWithPath:[NSTemporaryDirectory()
+                                        stringByAppendingPathComponent:NSUUID.UUID.UUIDString]
+                        isDirectory:YES];
+                NSArray *files = nil;
+                if (!error &&
+                    [NSFileManager.defaultManager createDirectoryAtURL:directory
+                                           withIntermediateDirectories:YES
+                                                            attributes:@{
+                                                                NSFilePosixPermissions : @0700
+                                                            }
+                                                                 error:&error])
+                    files = GSExportAsset(asset, directory, &error);
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    authorized = GSStillAuthorized(transfer);
+                });
+                if (files && !authorized && !transfer.cancelled)
+                    GSCount(@"authorizationChanged");
+                if (authorized && files) {
+                    NSMutableArray *hashes = [NSMutableArray array];
+                    for (NSURL *file in files) {
+                        NSString *hash = GSFileSHA1(file);
+                        if (hash)
+                            [hashes addObject:hash];
+                    }
+                    transfer.sha1s = hashes;
+                    job = GSImportFiles(files, destination, quality, asset.creationDate, &error);
+                }
+                [NSFileManager.defaultManager removeItemAtURL:directory error:nil];
+            }
             transfer.jobID = job;
             if (job && transfer.cancelled && transfer.cancelGo)
                 GSRequest(@{@"op" : @"cancel", @"id" : job}, nil);
@@ -256,6 +414,12 @@ static void GSStart(id request, SEL selector, IMP original) {
                     NSString *phase = state[@"state"];
                     if ([phase isEqual:@"completed"]) {
                         completed = [state[@"mediaKey"] length] > 0;
+                        if (completed && !reused && revision)
+                            GSRememberUploadedAsset(
+                                uploadKey,
+                                @{@"r" : revision,
+                                  @"j" : job,
+                                  @"s" : transfer.sha1s ?: @[]});
                         break;
                     }
                     if ([phase isEqual:@"failed"] || [phase isEqual:@"cancelled"])
@@ -511,6 +675,17 @@ static void GSBindScotty(void) {
                   }));
     }
 }
+static void GSBindFingerprint(Class c, NSString *name) {
+    SEL s = NSSelectorFromString(name);
+    if (!c || !GSPhotosHasMethod(c, name, "v32@0:8@16@24"))
+        return;
+    IMP old = method_getImplementation(class_getInstanceMethod(c, s));
+    GSReplace(c, s, imp_implementationWithBlock(^(id request, id fingerprint, id error) {
+                  if (!error)
+                      GSRecordFingerprint(request, fingerprint);
+                  ((void (*)(id, SEL, id, id))old)(request, s, fingerprint, error);
+              }));
+}
 void GSInstallBackupRequests(void) {
     if (GSInstalled || !GSIsGooglePhotos() || !GSPhotosHostSupported())
         return;
@@ -564,5 +739,8 @@ void GSInstallBackupRequests(void) {
                   }));
     }
     GSBindScotty();
+    GSBindFingerprint(asset, @"fingerprintDidComplete:error:");
+    GSBindFingerprint(NSClassFromString(@"GMUBackgroundAssetUploadRequest"),
+                      @"didReceiveFingerprint:error:");
     GSInstalled = YES;
 }
